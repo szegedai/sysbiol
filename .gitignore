@@ -1,0 +1,13 @@
+*.log
+*.gz
+*.csv
+*.png
+*.npy
+*.npz
+representations/
+data/
+alphas/
+predictions/
+__pycache__/
+dictionaries/
+trial_predictions
