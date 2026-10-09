@@ -4,6 +4,7 @@
 *.png
 *.npy
 *.npz
+*.swp
 representations/
 data/
 alphas/
@@ -11,3 +12,4 @@ predictions/
 __pycache__/
 dictionaries/
 trial_predictions
+tf_models

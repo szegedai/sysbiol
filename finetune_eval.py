@@ -119,14 +119,6 @@ def train(experiment_id, model, metric, num_epochs, training_data, eval_data, ba
 
     return metrics, losses, probs_per_data
 
-def map_seq_id(labels_list, label):
-    if label==0:
-        labels_list.append('O')
-    elif label % 2 == 1:
-        labels_list.append('B-{}'.format(label.item() // 2))
-    else:
-        labels_list.append('I-{}'.format((label.item()-1) // 2))
-
 def eval_model(model, eval_data, batch_size, metric, progress_bar):
 
     model.eval()
