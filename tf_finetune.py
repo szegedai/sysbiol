@@ -111,7 +111,7 @@ def main():
     parser = argparse.ArgumentParser(description='Finetuning experiments.')
 
     parser.add_argument('--tf_id')
-    parser.add_argument('--training_folder', default='/srv/data/berend/szbk2/CopciAB')
+    parser.add_argument('--training_folder', default='./CopciAB')
     parser.add_argument('--model', type=str, default='InstaDeepAI/nucleotide-transformer-v2-500m-multi-species')
     #InstaDeepAI/nucleotide-transformer-2.5b-multi-species
     #parser.add_argument('--model', type=str, default='InstaDeepAI/NTv3_650M_pre')
@@ -155,7 +155,7 @@ def main():
     parser.add_argument('--no_multihead', dest='mh', action='store_false')
     parser.set_defaults(mh=False)
     
-    parser.add_argument('--save_model', default='tf_models', type=str, help='Location to save file')
+    parser.add_argument('--save_model', default='./tf_models', type=str, help='Location to save file')
     parser.add_argument('--eval_frac', default=0.2, type=float)   
  
     args = parser.parse_args()
@@ -168,7 +168,7 @@ def main():
     device = torch.device(f"cuda:{args.gpu_id}") if torch.cuda.is_available() and args.gpu_id >= 0 else torch.device("cpu")
 
     data, labels = [], []
-    for f in glob.glob(f'{args.training_folder}/*.fasta'):
+    for f in glob.glob(f'{args.training_folder}/*.fasta*'):
         if args.tf_id is None or args.tf_id in f:
             d = process_fasta(f, deduplicate_seqs=False)
             logging.info(f'{f} {len(d)}')
@@ -185,7 +185,7 @@ def main():
     eval_data = train_data.select(range(cutoff_value))
     train_data = train_data.select(range(cutoff_value, len(train_data)))
 
-    eval2_data = pd.read_csv('03.TF_binding_table_Phchr4_2.csv', sep=',')
+    eval2_data = pd.read_csv('03.TF_binding_table_Phchr4_2.csv.gz', sep=',')
     data = eval2_data['upstream_CDS_1000bp'].tolist()
     eval2_data = Dataset.from_dict({'sequence': data, 'labels': eval2_data[f'{args.tf_id}'].tolist()})
     eval2_data= process_data(eval2_data, tokenizer, shuffle=False)
