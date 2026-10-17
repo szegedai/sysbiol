@@ -5,6 +5,7 @@
 *.png
 *.npy
 *.npz
+*.out
 *.swp
 representations/
 data/

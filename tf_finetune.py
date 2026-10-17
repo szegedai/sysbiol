@@ -6,20 +6,64 @@ import numpy as np
 import pandas as pd
 import random
 
-import evaluate
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_scheduler
 from tqdm.auto import tqdm
 from datasets import Dataset
 from process import process_fasta
-from tf_eval import eval_model, pad_batch, process_data
 
 from peft import get_peft_config, PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType
-from collections import Counter
 import logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     datefmt='%d-%b-%y %H:%M:%S',
                     stream=sys.stdout)
+
+def pad_batch(batch, device):
+    b = {}
+    max_length = max([len(b) for b in batch['input_ids']])
+    for f in batch.features:
+        if f=='labels':
+            b[f] = batch[f][:].to(device)
+        else:
+            b[f] = torch.vstack([torch.cat((b, torch.zeros(max_length - len(b), dtype=b.dtype))) for b in batch[f]]).to(device)
+    return b
+
+def eval_model(model, eval_data, batch_size, progress_bar=None, tokenizer=None):
+    model.eval()
+    out_probs, preds, etalons = [], [], []
+    for batch_id in tqdm(range(int(np.ceil(len(eval_data) / batch_size)))):
+        to_index = min(len(eval_data), (batch_id+1)*batch_size)
+        batch_seqs = eval_data.select(range(batch_id*batch_size, to_index))
+        batch = pad_batch(eval_data.select(range(batch_id*batch_size, to_index)), model.device)
+        with torch.no_grad():
+            outputs = model(**batch)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        out_probs.extend(probs[:,1].tolist())
+        etalons.extend(batch['labels'].tolist())
+        predictions = torch.argmax(probs, dim=-1)
+        preds.extend(predictions.tolist())
+        if progress_bar is not None:
+            progress_bar.update(1)
+    metrics = {'f1': f1_score(etalons, preds), 'roc': roc_auc_score(etalons, out_probs), 'accuracy': accuracy_score(etalons, preds), 'confusion_matrix': confusion_matrix(etalons, preds), 'classification_report': classification_report(etalons, preds)}
+    return metrics, out_probs, etalons
+
+def process_data(data, tokenizer, samples_to_use=-1, shuffle=True):
+    def tokenize(examples):
+        return tokenizer(examples['sequence'], padding=False, truncation=True)
+
+    data = data.shuffle(seed=42) if shuffle else data
+
+    if samples_to_use < 0 or samples_to_use > len(data):
+        samples_to_use = len(data)
+    elif samples_to_use < 1:
+        samples_to_use = int(samples_to_use * len(data))
+    data = data.select(range(samples_to_use))
+    data = data.map(tokenize, batched=True)
+
+    to_keep = set(('labels input_ids attention_mask token_type_ids').split())
+    data = data.remove_columns([col for col in data.features if col not in to_keep])
+    data.set_format("torch")
+    return data
 
 def get_optimizer_and_scheduler(m, training_steps, lr=2e-5, warmup_ratio=0.0, weight_decay=0.01):
     optimizer = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=weight_decay)
@@ -33,7 +77,7 @@ def get_optimizer_and_scheduler(m, training_steps, lr=2e-5, warmup_ratio=0.0, we
     return optimizer, scheduler
 
 
-def train(experiment_id, model, metric, num_epochs, training_data, eval_data, batch_size, grad_accum,
+def train(experiment_id, model, num_epochs, training_data, eval_data, batch_size, grad_accum,
           lr=2e-5, warmup_rate=0, shuffle_seed=42, log_predictions=False, clip=0.0, weight_decay=0.01, weight_log=False, use_amp=False, dtype=None):
 
     amp_settings = {"device_type":model.device.type,
@@ -43,8 +87,7 @@ def train(experiment_id, model, metric, num_epochs, training_data, eval_data, ba
     ref_model = copy.deepcopy(model)
     ref_model.to('cpu')
 
-    metrics, losses = [], [0.0]
-    probs_per_data = []
+    losses = [0.0]
    
     num_training_steps = num_epochs * int(np.ceil(len(training_data) / (batch_size * grad_accum)))
     num_eval_steps = num_epochs * (0 if eval_data is None else int(np.ceil(len(eval_data) / batch_size)))
@@ -99,13 +142,19 @@ def train(experiment_id, model, metric, num_epochs, training_data, eval_data, ba
                 delta_weights = params.detach().cpu() - ref_model.get_parameter(param_name)
                 logging.info(f"WEIGHT@{epoch}\t{experiment_id}\t{param_name}\t{torch.linalg.norm(delta_weights).item()}\t{np.prod(params.size())}")
 
-        if metric is not None and eval_data is not None:
-            performances, out_probs, etalons = eval_model(model, eval_data, batch_size, metric, progress_bar) #, tokenizer)
+        if eval_data is not None:
+            performances, out_probs, etalons = eval_model(model, eval_data, batch_size, progress_bar)
             for performance, value in performances.items():
-                metrics.append(performance)
                 logging.info(f"{epoch} {performance} {value:.4f}")
 
-    return metrics, losses
+    return losses
+
+def set_seed(s):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
 
 def main():
     parser = argparse.ArgumentParser(description='Finetuning experiments.')
@@ -117,7 +166,7 @@ def main():
     #parser.add_argument('--model', type=str, default='InstaDeepAI/NTv3_650M_pre')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU to use (default:0)')
     parser.add_argument('--train_samples', type=int, default=-1)
-    parser.add_argument('--epochs', type=int, default=3, help='Epochs to run (default:3)')
+    parser.add_argument('--epochs', type=int, default=4, help='Epochs to run (default:3)')
     parser.add_argument('--num_experiments', type=int, default=3, help='Epochs to run (default:3)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (default:32)')
     parser.add_argument('--grad_accum', type=int, default=1, help='Batch size (default:1)')
@@ -159,8 +208,6 @@ def main():
     parser.add_argument('--eval_frac', default=0.2, type=float)   
  
     args = parser.parse_args()
-    #if args.reference_model is None:
-    #    args.reference_model = args.tokenizer
     args.mh = args.mh or args.num_heads > 1
     logging.info(args)
 
@@ -192,48 +239,49 @@ def main():
 
     logging.info(f'{len(train_data)} {len(eval_data)} {len(eval2_data)}')
 
-    metric = evaluate.load('glue', 'mrpc')
+    torch.set_float32_matmul_precision('high')
     for run in range(args.num_experiments):
         model_path = f"{args.save_model}/{args.tf_id}_{args.epochs}_{args.start_seed+run}_{args.num_heads}_{args.smoothing}_{args.trainable_head}_{args.lora_r}_{args.model.replace('/', '_')}"
-        model_exists = os.path.exists(model_path)
-        logging.info(f"SAVE\t{args.save_model}\t{args.tf_id}_{args.epochs}_{args.start_seed+run}_{args.num_heads}_{args.smoothing}_{args.trainable_head}_{args.model.replace('/', '_')}")
-        random.seed(args.start_seed + run)
-        np.random.seed(args.start_seed + run)
-        torch.manual_seed(args.start_seed + run)
-        torch.cuda.manual_seed(args.start_seed + run)
-        torch.cuda.manual_seed_all(args.start_seed + run)
+        set_seed((seed:=args.start_seed + run))
+        if os.path.exists(model_path) is False:
+            logging.info(f"{args.save_model}\t{args.tf_id}_{args.epochs}_{args.start_seed+run}_{args.num_heads}_{args.smoothing}_{args.trainable_head}_{args.model.replace('/', '_')}")
+            model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2, trust_remote_code=True).to(device)
 
-        model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2, trust_remote_code=True)
-        num_epochs = args.epochs
-          
-        model = model.to(device)
-        torch.set_float32_matmul_precision('high')
+            if args.lora_r > 0:
+                peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, r=args.lora_r, lora_alpha=args.lora_r, lora_dropout=0.1, target_modules='all-linear', bias="all")
+                model = get_peft_model(model, peft_config)
+                model.print_trainable_parameters()
 
-        if args.lora_r > 0:
-            peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, r=args.lora_r, lora_alpha=args.lora_r, lora_dropout=0.1, target_modules='all-linear', bias="all")
-            model = get_peft_model(model, peft_config)
-            model.print_trainable_parameters()
-
-        layers_to_train = ['classifier', 'pooler',] + [f'layer.{l}' for l in range(model.config.num_hidden_layers - args.tunable, model.config.num_hidden_layers)]
-        logging.info(layers_to_train)
+            layers_to_train = ['classifier', 'pooler',] + [f'layer.{l}' for l in range(model.config.num_hidden_layers - args.tunable, model.config.num_hidden_layers)]
+            logging.info(layers_to_train)
     
-        if args.tunable > -1:
-            for p in model.named_parameters():
-                if np.any([x in p[0] for x in layers_to_train]):
-                    p[1].requires_grad = True
-                else:
-                    p[1].requires_grad = False
+            if args.tunable > -1:
+                for p in model.named_parameters():
+                    p[1].requires_grad = np.any([x in p[0] for x in layers_to_train])
 
-        results, losses = train(run, model, metric, num_epochs, train_data, eval_data, args.batch_size, args.grad_accum,
-                                lr=args.lr, warmup_rate=args.warmup_ratio, log_predictions=args.log_predictions,
-                                clip=args.grad_clipping, weight_decay=args.weight_decay, weight_log=args.weight_log, use_amp=args.amp)
+            results, losses = train(run, model, args.epochs, train_data, eval_data, args.batch_size, args.grad_accum,
+                                    lr=args.lr, warmup_rate=args.warmup_ratio, log_predictions=args.log_predictions,
+                                    clip=args.grad_clipping, weight_decay=args.weight_decay, weight_log=args.weight_log, use_amp=args.amp)
+            if args.save_model:
+                model.save_pretrained(model_path)
+            logging.info(f'Finetuning finished and written to {model_path}')
+        else:
+            if os.path.exists(f'{model_path}/adapter_config.json'):
+                base_model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2, trust_remote_code=True)
+                model = PeftModel.from_pretrained(base_model, model_path).merge_and_unload(safe_merge=True).to(device)
+            else:
+                model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2, trust_remote_code=True).to(device)
         
-        performances2, out_probs, etalons = eval_model(model, eval2_data, 1024, metric)
-        for performance, value in performances2.items():
-            logging.info(f"heldout {performance} {value:.4f}")
-        if args.save_model:
-            model.save_pretrained(model_path)
-        logging.info(f'Finetuning finished and written to {model_path}')
+        for ed_name, ed in zip('in out'.split(), [eval_data, eval2_data]):
+            performances2, out_probs, etalons = eval_model(model, ed, 1024)
+            if ed_name=='out':
+                with open(f'{model_path.replace("/", "_")[2:]}_{args.tf_id}.out', 'w') as fo:
+                    fo.write(f'{args.tf_id}\n')
+                    for i,(op, et) in enumerate(zip(out_probs, etalons)):
+                        fo.write(f'{op:.5f}\n')
+            with open(f'{args.tf_id}_{seed}_{ed_name}Domain.log', 'w') as fo:
+                for performance, value in performances2.items():
+                    fo.write(f"{ed_name}-data\t{performance}\t{value}\n")
 
 if __name__=='__main__':
     main()
